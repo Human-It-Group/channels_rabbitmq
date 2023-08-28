@@ -263,19 +263,8 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
                     continue  # retry
 
                 try:
-                    await _setup_connection(
-                        connection=connection,
-                        queue_name=self._queue_name,
-                        remote_capacity=self.remote_capacity,
-                        expiry=self.expiry,
-                        groups_exchange=self.groups_exchange,
-                    )
-                    await _setup_subscriptions(
-                        connection=connection,
-                        queue_name=self._queue_name,
-                        groups_exchange=self.groups_exchange,
-                        groups=self._multi_queue._local_groups.keys(),
-                    )
+                    await self.setup_connection(connection=connection)
+                    await self.setup_subscriptions(connection=connection)
                 except (carehare.ChannelClosedByServer, *EXPECTED_EXCEPTIONS) as err:
                     logger.exception(
                         "Failure declaring RabbitMQ objects: %s. Will retry.",
@@ -293,12 +282,7 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
                 break
 
             try:
-                await consume_into_multi_queue_until_connection_close(
-                    connection=connection,
-                    channel=self._queue_name,
-                    multi_queue=self._multi_queue,
-                    prefetch_count=self.local_capacity,
-                )
+                await self.start_consume(connection=connection)
                 await connection.closed
             except EXPECTED_EXCEPTIONS as err:
                 logger.exception(
@@ -319,6 +303,31 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
                 logger.exception(
                     "Failure closing RabbitMQ connection: %s. Moving on....", str(err)
                 )
+
+    async def setup_connection(self, connection: carehare.Connection) -> None:
+        await _setup_connection(
+            connection=connection,
+            queue_name=self._queue_name,
+            remote_capacity=self.remote_capacity,
+            expiry=self.expiry,
+            groups_exchange=self.groups_exchange,
+        )
+
+    async def setup_subscriptions(self, connection: carehare.Connection) -> None:
+        await _setup_subscriptions(
+            connection=connection,
+            queue_name=self._queue_name,
+            groups_exchange=self.groups_exchange,
+            groups=self._multi_queue._local_groups.keys(),
+        )
+
+    async def start_consume(self, connection: carehare.Connection) -> None:
+        await consume_into_multi_queue_until_connection_close(
+            connection=connection,
+            channel=self._queue_name,
+            multi_queue=self._multi_queue,
+            prefetch_count=self.local_capacity,
+        )
 
     async def close(self):
         """Close our RabbitMQ connection and all tasks.
