@@ -253,7 +253,7 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
                         connect_timeout=self.connect_timeout,
                         ssl=self.ssl_context,
                     )
-                    await connection.connect()
+                    await asyncio.wait_for(connection.connect(), timeout=self.connect_timeout)
                 except (asyncio.TimeoutError, *EXPECTED_EXCEPTIONS) as err:
                     logger.exception(
                         "Failure connecting to RabbitMQ: %s. Retrying", str(err)
