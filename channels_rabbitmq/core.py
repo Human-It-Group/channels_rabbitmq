@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import string
@@ -22,7 +23,8 @@ from .util import (
 
 logger = logging.getLogger(__name__)
 
-ReconnectDelay = 1.0  # seconds
+ReconnectDelay = 1.0  # seconds -- delay before the first reconnect attempt
+MaxReconnectDelay = 30.0  # seconds -- ceiling for the exponential backoff
 
 
 async def _setup_connection(
@@ -212,6 +214,7 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
             carehare.Connection
         ] = asyncio.Future()
         self._want_close: bool = False
+        self._reconnect_delay: float = ReconnectDelay
 
     @property
     def carehare_connection(self) -> asyncio.Future[carehare.Connection]:
@@ -238,71 +241,123 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
 
         Cancel this task on event-loop shutdown (and at no other time). This
         will make `self.carehare_connection` raise `asyncio.CancelledError`.
+
+        This task must outlive the failure of any single connection. If it ever
+        returns or raises, the layer is dead for good: `carehare_connection`
+        spawns it exactly once and nothing recreates it, so the process goes on
+        accepting messages while delivering none of them.
+
+        That is why everything but `CancelledError` is caught here, instead of an
+        enumerated list of "expected" exceptions. `carehare`'s exceptions all
+        derive straight from `Exception` with no shared base -- so such a list
+        silently drifts out of sync with the library -- and
+        `setup_connection()`, `setup_subscriptions()` and `start_consume()` are
+        subclass extension points that may raise anything at all. Whatever comes
+        out, the meaning is the same: this connection is gone. Log it, reset
+        state, reconnect.
         """
-        EXPECTED_EXCEPTIONS = (
-            carehare.ConnectionClosedByServer,
-            carehare.ConnectionClosedByHeartbeatMonitor,
-            OSError,
-        )
+        while not self._want_close:
+            connection = None
+            try:
+                connection = await self._connect_and_setup()
+                if connection is None:
+                    break  # close() was called while we were retrying
 
-        while not self._want_close:  # Reconnect (after disconnect) repeatedly
-            while not self._want_close:  # Retry initial connect repeatedly
-                try:
-                    connection = carehare.Connection(
-                        url=self.host,
-                        connect_timeout=self.connect_timeout,
-                        ssl=self.ssl_context,
-                    )
-                    await asyncio.wait_for(connection.connect(), timeout=self.connect_timeout)
-                except (asyncio.TimeoutError, *EXPECTED_EXCEPTIONS) as err:
-                    logger.exception(
-                        "Failure connecting to RabbitMQ: %s. Retrying", str(err)
-                    )
-                    await asyncio.sleep(ReconnectDelay)
-                    connection = None  # in case _want_close=True
-                    continue  # retry
-
-                try:
-                    await self.setup_connection(connection=connection)
-                    await self.setup_subscriptions(connection=connection)
-                except (carehare.ChannelClosedByServer, *EXPECTED_EXCEPTIONS) as err:
-                    logger.exception(
-                        "Failure declaring RabbitMQ objects: %s. Will retry.",
-                        str(err),
-                    )
-                    await asyncio.sleep(ReconnectDelay)
-                    connection = None  # in case _want_close=True
-                    continue  # retry
+                if self._want_close:
+                    # close() landed while we were connecting. Do not start
+                    # consuming: nothing would ever interrupt it, and close() is
+                    # already awaiting this task. `finally` closes `connection`.
+                    break
 
                 self._carehare_connection.set_result(connection)
+                self._reconnect_delay = ReconnectDelay  # a good connection resets it
                 logger.info("Connected to RabbitMQ")
-                break
-
-            if self._want_close:
-                break
-
-            try:
                 await self.start_consume(connection=connection)
-                await connection.closed
-            except EXPECTED_EXCEPTIONS as err:
-                logger.exception(
-                    "Disconnected from RabbitMQ: %s. Will reconnect.", str(err)
-                )
+            except asyncio.CancelledError:
+                raise  # event-loop shutdown: the one way out of this loop
+            except Exception:
+                if self._want_close:
+                    logger.debug("RabbitMQ connection ended during close()")
+                else:
+                    logger.exception("Disconnected from RabbitMQ. Will reconnect.")
+            finally:
+                # Unconditional, and in `finally` rather than after the `except`:
+                # a Future left resolved with a dead connection makes `send()`
+                # publish into the void and makes health checks report a healthy
+                # layer. A pending Future stalls senders until we reconnect,
+                # which is what they already expect.
+                self._carehare_connection = asyncio.Future()
+                if connection is not None:
+                    with contextlib.suppress(Exception):
+                        # `close()` awaits `connection.closed`, so it re-raises
+                        # whatever killed the connection. Never let cleanup end
+                        # the loop we just hardened.
+                        await connection.close()
 
-            self._carehare_connection = asyncio.Future()
-            try:
-                await connection.close()
-            except EXPECTED_EXCEPTIONS:
-                pass
+            await self._sleep_before_retry()
+
+    async def _connect_and_setup(self) -> Optional[carehare.Connection]:
+        """Connect to RabbitMQ and declare our objects, retrying until it works.
+
+        Returns None if `close()` was called while we were still retrying.
+        """
+        while not self._want_close:
             connection = None
-
-        if connection is not None:
             try:
-                await connection.close()
-            except EXPECTED_EXCEPTIONS as err:
-                logger.exception(
-                    "Failure closing RabbitMQ connection: %s. Moving on....", str(err)
+                connection = carehare.Connection(
+                    url=self.host,
+                    connect_timeout=self.connect_timeout,
+                    ssl=self.ssl_context,
                 )
+                # carehare's own connect_timeout only bounds the TCP/TLS connect,
+                # not the AMQP handshake after it: a broker that accepts the
+                # socket and then stalls would hang us forever.
+                await asyncio.wait_for(
+                    connection.connect(), timeout=self.connect_timeout
+                )
+                await self.setup_connection(connection=connection)
+                await self.setup_subscriptions(connection=connection)
+                return connection
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                logger.exception(
+                    "Failure connecting to RabbitMQ: %s. Retrying", str(err)
+                )
+                if connection is not None:
+                    with contextlib.suppress(Exception):
+                        await connection.close()
+                await self._sleep_before_retry()
+
+        return None
+
+    async def _sleep_before_retry(self) -> None:
+        """Back off before the next connection attempt.
+
+        The delay grows exponentially up to `MaxReconnectDelay` and resets once a
+        connection succeeds. Without this, every instance in the fleet retries in
+        lockstep once a second, hammering a broker that is typically mid-recovery
+        (electing quorum-queue leaders) and least able to take it -- while
+        emitting a stack trace per attempt per process.
+
+        Jitter only ever *adds* to the delay, so the first retry still waits at
+        least `ReconnectDelay`, as callers of `send()` rely on.
+
+        Sleeps in short slices so `close()` never waits a full backoff period.
+        """
+        if self._want_close:
+            return
+
+        delay = self._reconnect_delay * (1.0 + random.random() * 0.5)
+        self._reconnect_delay = min(self._reconnect_delay * 2, MaxReconnectDelay)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + delay
+        while not self._want_close:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 1.0))
 
     async def setup_connection(self, connection: carehare.Connection) -> None:
         await _setup_connection(
