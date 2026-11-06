@@ -772,3 +772,83 @@ async def test_reconnect_after_setup_stalls(fast_reconnect, caplog):
         await _assert_recovers(layer)
 
     assert "Failure connecting to RabbitMQ: TimeoutError()" in caplog.text
+
+
+@ASYNC_TEST
+async def test_abandoned_connection_is_closed_after_handshake_stall(fast_reconnect):
+    """
+    A connection given up during a stalled handshake must not keep its socket.
+
+    `close()` refuses to run before the handshake completes, so without an abort
+    every attempt against a broker that accepts TCP and never answers leaks one.
+    """
+    peer_closed = asyncio.Event()
+
+    async def handle(reader, writer):
+        await reader.read()  # returns on EOF: the client dropped the socket
+        peer_closed.set()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with open_layer(
+            host=f"amqp://guest:guest@127.0.0.1:{port}/", ssl_context=None
+        ) as layer:
+            layer.connect_timeout = 0.3
+            layer.setup_timeout = 0.3
+            layer.carehare_connection  # start connecting
+            await asyncio.wait_for(peer_closed.wait(), timeout=5)
+    finally:
+        server.close()
+
+
+@ASYNC_TEST
+async def test_close_quietly_aborts_a_connection_whose_close_hangs():
+    """
+    A connection whose `close()` never completes must still lose its socket.
+
+    A stalled broker never sends CloseOk. Leaving the socket open keeps our
+    heartbeats flowing and our exclusive queue locked by a dead connection.
+    """
+    async with open_layer() as layer:
+        layer.connect_timeout = 0.3
+        connection = carehare.Connection(url=HOST, ssl=SSL_CONTEXT)
+        await connection.connect()
+
+        async def close_forever():
+            await asyncio.Event().wait()
+
+        connection.close = close_forever
+        await layer._close_quietly(connection)
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(connection.closed), timeout=1)
+        assert connection.closed.done()
+
+
+class ReturnOnceLayer(RabbitmqChannelLayer):
+    """Layer whose first `start_consume()` returns, as after a clean disconnect."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.n_raised = 0
+        self.consuming = asyncio.Event()
+
+    async def start_consume(self, connection):
+        if self.n_raised == 0:
+            self.n_raised += 1
+            return
+        self.consuming.set()
+        await super().start_consume(connection=connection)
+
+
+@ASYNC_TEST
+async def test_clean_disconnect_is_logged(fast_reconnect, caplog):
+    """
+    A `start_consume()` that returns normally must be logged as a disconnect.
+    """
+    async with open_layer(queue_name="x", layer_class=ReturnOnceLayer) as layer:
+        await _assert_recovers(layer)
+
+    assert "Disconnected from RabbitMQ. Will reconnect." in caplog.text

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import random
 import string
@@ -126,6 +125,15 @@ carehare directly. Your service will be simpler and it will scale better.
 
 def _random_letters(n: int) -> str:
     return "".join(random.choice(string.ascii_letters) for i in range(n))
+
+
+def _abort_transport(connection: carehare.Connection) -> None:
+    # carehare (1.0.x) exposes no public abort. Before the TCP connect finishes
+    # there is no protocol yet, and aborting a closed transport is a no-op.
+    protocol = getattr(connection, "_protocol", None)
+    transport = getattr(protocol, "_transport", None)
+    if transport is not None:
+        transport.abort()
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):
@@ -275,6 +283,8 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
                 self._reconnect_delay = ReconnectDelay  # a good connection resets it
                 logger.info("Connected to RabbitMQ")
                 await self.start_consume(connection=connection)
+                if not self._want_close:
+                    logger.warning("Disconnected from RabbitMQ. Will reconnect.")
             except asyncio.CancelledError:
                 raise  # event-loop shutdown: the one way out of this loop
             except Exception:
@@ -336,9 +346,21 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
         `close()` awaits `connection.closed`, so it re-raises whatever killed the
         connection, and it waits for the broker's CloseOk, which a stalled broker
         never sends. Neither may stall or end the reconnect loop.
+
+        If `close()` fails or times out, abort the socket: carehare otherwise keeps
+        it and its heartbeat timer alive, and the broker keeps our exclusive queue
+        locked by the abandoned connection.
         """
-        with contextlib.suppress(Exception):
+        try:
             await asyncio.wait_for(connection.close(), timeout=self.connect_timeout)
+        except asyncio.CancelledError:
+            _abort_transport(connection)
+            raise
+        except asyncio.TimeoutError:
+            logger.warning("Timed out closing a RabbitMQ connection. Aborting it")
+            _abort_transport(connection)
+        except Exception:
+            _abort_transport(connection)
 
     async def _sleep_before_retry(self) -> None:
         """Back off before the next connection attempt.
