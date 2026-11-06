@@ -5,14 +5,16 @@ import threading
 import time
 from pathlib import Path
 
+import carehare
 import pytest
 from channels.exceptions import ChannelFull, StopConsumer
 
+from channels_rabbitmq import core
 from channels_rabbitmq.core import RabbitmqChannelLayer, ReconnectDelay
 
 HOST = "amqps://guest:guest@localhost"
 SSL_CONTEXT = ssl.create_default_context(
-    cafile=str(Path(__file__).parent.parent / "ssl" / "server.cert")
+    cafile=str(Path(__file__).parent.parent / "ssl" / "ca.cert")
 )
 SSL_CONTEXT.load_cert_chain(
     certfile=str(Path(__file__).parent.parent / "ssl" / "client.certchain"),
@@ -27,6 +29,7 @@ def ASYNC_TEST(fn):
 @contextlib.asynccontextmanager
 async def open_layer(**kwargs):
     queue_name = kwargs.pop("queue_name", None)
+    layer_class = kwargs.pop("layer_class", RabbitmqChannelLayer)
 
     kwargs = {
         "host": HOST,
@@ -34,7 +37,7 @@ async def open_layer(**kwargs):
         **kwargs,
     }
 
-    layer = RabbitmqChannelLayer(**kwargs)
+    layer = layer_class(**kwargs)
     if queue_name is not None:
         layer._queue_name = queue_name
     try:
@@ -605,3 +608,167 @@ async def test_concurrent_send():
 
         assert set([m.result()["type"] for m in group_receives]) == texts
         assert set([m.result()["type"] for m in direct_receives]) == texts
+
+
+class FailOnceLayer(RabbitmqChannelLayer):
+    """Layer that fails the first `times` attempts at the given `stage`.
+
+    `stage="consume"` stands in for everything that can go wrong once a
+    connection is up: the broker vanishing, or a bug in a subclass's consume
+    code. `stage="setup"` stands in for a broker that drops or stalls us while
+    we declare our queue. `exc=None` hangs instead of raising.
+    """
+
+    def __init__(self, *, exc, times=1, stage="consume", **kwargs):
+        super().__init__(**kwargs)
+        self._exc = exc
+        self._times_left = times
+        self._stage = stage
+        self.n_raised = 0
+        self.consuming = asyncio.Event()
+
+    async def _maybe_fail(self, stage):
+        if self._stage == stage and self._times_left > 0:
+            self._times_left -= 1
+            self.n_raised += 1
+            if self._exc is None:
+                await asyncio.Event().wait()  # never set: a stalled broker
+            raise self._exc
+
+    async def setup_connection(self, connection):
+        await self._maybe_fail("setup")
+        await super().setup_connection(connection=connection)
+
+    async def start_consume(self, connection):
+        await self._maybe_fail("consume")
+        self.consuming.set()
+        await super().start_consume(connection=connection)
+
+
+@pytest.fixture
+def fast_reconnect(monkeypatch):
+    """Shrink the reconnect backoff so these tests fit in the 8s timeout."""
+    monkeypatch.setattr(core, "ReconnectDelay", 0.3)
+    monkeypatch.setattr(core, "MaxReconnectDelay", 1.0)
+
+
+async def _assert_recovers(layer):
+    """Wait out the injected failure, then prove the layer works again."""
+    layer.carehare_connection  # start connecting
+    await asyncio.wait_for(layer.consuming.wait(), timeout=6)
+    assert layer.n_raised > 0, "start_consume() never raised; test proves nothing"
+    assert not layer._reconnect_forever_task.done(), "the supervisor task ended"
+
+    await layer.send("x!1", {"type": "after.reconnect"})
+    assert (await layer.receive("x!1"))["type"] == "after.reconnect"
+
+
+@ASYNC_TEST
+async def test_reconnect_after_bare_connection_closed(fast_reconnect):
+    """
+    A bare `ConnectionClosed` must not end the reconnect loop.
+
+    `carehare` hands every channel a plain `ConnectionClosed` when the broker
+    goes away without sending a Close() frame -- a killed node, a reclaimed spot
+    instance. It shares no base class with carehare's other exceptions, so a
+    supervisor that enumerates "expected" types lets it through. The task then
+    dies and is never respawned, and the layer accepts messages while delivering
+    none of them until the process restarts.
+
+    `open_layer()` calls `close()` on the way out, so this also covers `close()`
+    hanging or re-raising after a failed connection.
+    """
+    async with open_layer(
+        queue_name="x", layer_class=FailOnceLayer, exc=carehare.ConnectionClosed()
+    ) as layer:
+        await _assert_recovers(layer)
+
+
+@ASYNC_TEST
+async def test_reconnect_after_arbitrary_exception(fast_reconnect):
+    """
+    Any exception out of `start_consume()` must not end the reconnect loop.
+
+    `start_consume()` is a subclass extension point, so a bug in a subclass's
+    deserialization can raise anything at all. One bad message should cost one
+    connection, not the whole layer.
+    """
+    async with open_layer(
+        queue_name="x", layer_class=FailOnceLayer, exc=ValueError("boom")
+    ) as layer:
+        await _assert_recovers(layer)
+
+
+@ASYNC_TEST
+async def test_reconnect_after_repeated_failures(fast_reconnect):
+    """
+    The loop must survive more than one failure in a row.
+    """
+    async with open_layer(
+        queue_name="x",
+        layer_class=FailOnceLayer,
+        exc=carehare.ConnectionClosed(),
+        times=3,
+    ) as layer:
+        await _assert_recovers(layer)
+        assert layer.n_raised == 3
+
+
+@ASYNC_TEST
+async def test_connection_future_unresolved_while_reconnecting(fast_reconnect):
+    """
+    A dead connection must leave `carehare_connection` unresolved.
+
+    Senders await that Future. If it stays resolved with the connection that just
+    died, they publish into the void instead of waiting for the new connection --
+    and health checks that inspect it report a perfectly healthy layer.
+    """
+    async with open_layer(
+        queue_name="x", layer_class=FailOnceLayer, exc=carehare.ConnectionClosed()
+    ) as layer:
+        layer.carehare_connection  # start connecting
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 6.0
+        while loop.time() < deadline:
+            if layer.n_raised > 0 and not layer._carehare_connection.done():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError(
+                "carehare_connection stayed resolved after the connection died"
+            )
+
+        await _assert_recovers(layer)
+
+
+@ASYNC_TEST
+async def test_reconnect_after_connection_closed_during_setup(fast_reconnect):
+    """
+    A `ConnectionClosed` while declaring our queue must not end the reconnect loop.
+
+    When the broker drops the socket mid-setup, carehare fails every pending RPC
+    (such as `queue_declare()`) with a bare `ConnectionClosed`. A broker node that
+    is still starting up does exactly this.
+    """
+    async with open_layer(
+        queue_name="x",
+        layer_class=FailOnceLayer,
+        exc=carehare.ConnectionClosed(),
+        stage="setup",
+    ) as layer:
+        await _assert_recovers(layer)
+
+
+@ASYNC_TEST
+async def test_reconnect_after_setup_stalls(fast_reconnect, caplog):
+    """
+    A setup that never completes must time out, be logged and be retried.
+    """
+    async with open_layer(
+        queue_name="x", layer_class=FailOnceLayer, exc=None, stage="setup"
+    ) as layer:
+        layer.setup_timeout = 0.5
+        await _assert_recovers(layer)
+
+    assert "Failure connecting to RabbitMQ: TimeoutError()" in caplog.text

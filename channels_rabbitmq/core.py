@@ -173,6 +173,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     ):
         self.host = host
         self.connect_timeout = 10.0  # seconds
+        # Bounds connect + handshake + declares as one attempt.
+        self.setup_timeout = 30.0  # seconds
         self.local_capacity = local_capacity
         self.remote_capacity = remote_capacity
         self.expiry = expiry
@@ -288,11 +290,7 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
                 # which is what they already expect.
                 self._carehare_connection = asyncio.Future()
                 if connection is not None:
-                    with contextlib.suppress(Exception):
-                        # `close()` awaits `connection.closed`, so it re-raises
-                        # whatever killed the connection. Never let cleanup end
-                        # the loop we just hardened.
-                        await connection.close()
+                    await self._close_quietly(connection)
 
             await self._sleep_before_retry()
 
@@ -309,27 +307,38 @@ beware: `asgiref` *does* let you to call `async_to_sync()` without
                     connect_timeout=self.connect_timeout,
                     ssl=self.ssl_context,
                 )
-                # carehare's own connect_timeout only bounds the TCP/TLS connect,
-                # not the AMQP handshake after it: a broker that accepts the
-                # socket and then stalls would hang us forever.
+                # carehare's connect_timeout only bounds the TCP/TLS connect. A
+                # broker that is still starting can accept the socket and then
+                # never answer the handshake or a declare, which would hang us.
                 await asyncio.wait_for(
-                    connection.connect(), timeout=self.connect_timeout
+                    self._open_and_setup(connection), timeout=self.setup_timeout
                 )
-                await self.setup_connection(connection=connection)
-                await self.setup_subscriptions(connection=connection)
                 return connection
             except asyncio.CancelledError:
                 raise
             except Exception as err:
-                logger.exception(
-                    "Failure connecting to RabbitMQ: %s. Retrying", str(err)
-                )
+                # %r: a timeout's str() is empty, which hides what failed.
+                logger.exception("Failure connecting to RabbitMQ: %r. Retrying", err)
                 if connection is not None:
-                    with contextlib.suppress(Exception):
-                        await connection.close()
+                    await self._close_quietly(connection)
                 await self._sleep_before_retry()
 
         return None
+
+    async def _open_and_setup(self, connection: carehare.Connection) -> None:
+        await connection.connect()
+        await self.setup_connection(connection=connection)
+        await self.setup_subscriptions(connection=connection)
+
+    async def _close_quietly(self, connection: carehare.Connection) -> None:
+        """Close a connection we are abandoning, without ever raising or hanging.
+
+        `close()` awaits `connection.closed`, so it re-raises whatever killed the
+        connection, and it waits for the broker's CloseOk, which a stalled broker
+        never sends. Neither may stall or end the reconnect loop.
+        """
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(connection.close(), timeout=self.connect_timeout)
 
     async def _sleep_before_retry(self) -> None:
         """Back off before the next connection attempt.
